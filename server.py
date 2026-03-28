@@ -29,6 +29,10 @@ import json
 import os
 import sqlite3
 import subprocess
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +45,152 @@ CHAT_DB_PATH = Path.home() / "Library" / "Messages" / "chat.db"
 
 # Apple epoch offset: seconds between Unix epoch (1970-01-01) and Apple epoch (2001-01-01)
 APPLE_EPOCH_OFFSET = 978307200
+
+
+# ---------------------------------------------------------------------------
+# Helpers — imessage-api REST client
+# ---------------------------------------------------------------------------
+
+
+class ImessageApiClient:
+    """HTTP client for the imessage-api REST backend."""
+
+    def __init__(self, base_url: str, password: str):
+        self.base_url = base_url.rstrip("/")
+        self.password = password
+        self._token: str | None = None
+        self._chats_cache: list | None = None
+        self._chats_cache_time: float = 0
+
+    def _authenticate(self) -> None:
+        body = json.dumps({"password": self.password}).encode()
+        req = urllib.request.Request(
+            f"{self.base_url}/auth/login",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        self._token = data["token"]
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict | None = None,
+        body: dict | None = None,
+    ) -> any:
+        if self._token is None:
+            self._authenticate()
+
+        url = f"{self.base_url}{path}"
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+
+        data = json.dumps(body).encode() if body else None
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "application/json",
+        }
+
+        for attempt in range(2):
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 0:
+                    self._authenticate()
+                    headers["Authorization"] = f"Bearer {self._token}"
+                    continue
+                raise
+
+    def _get(self, path: str, params: dict | None = None) -> any:
+        return self._request("GET", path, params=params)
+
+    def _post(self, path: str, body: dict | None = None) -> any:
+        return self._request("POST", path, body=body)
+
+    def get_chats(self, limit: int = 100) -> list:
+        """Get chats, cached for 30 seconds."""
+        now = time.time()
+        if self._chats_cache is not None and (now - self._chats_cache_time) < 30:
+            return self._chats_cache[:limit]
+        chats = self._get("/chats", {"limit": str(min(limit, 500))})
+        self._chats_cache = chats
+        self._chats_cache_time = now
+        return chats[:limit]
+
+    def health(self) -> dict:
+        """Check API health (unauthenticated)."""
+        req = urllib.request.Request(f"{self.base_url}/health")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
+
+
+_api_client: ImessageApiClient | None = None
+_api_checked = False
+
+
+def _get_api() -> ImessageApiClient | None:
+    """Lazily initialize the API client from env vars, or return None."""
+    global _api_client, _api_checked
+    if _api_checked:
+        return _api_client
+    _api_checked = True
+    url = os.environ.get("IMESSAGE_API_URL", "")
+    password = os.environ.get("IMESSAGE_API_PASSWORD", "")
+    if url and password:
+        _api_client = ImessageApiClient(url, password)
+    return _api_client
+
+
+def _service_from_guid(guid: str) -> str:
+    """Extract service type (iMessage/SMS) from a chat GUID."""
+    if guid.startswith("iMessage;"):
+        return "iMessage"
+    elif guid.startswith("SMS;"):
+        return "SMS"
+    return "unknown"
+
+
+def _unix_ms_to_iso(ts_ms: int | None) -> str:
+    """Convert Unix milliseconds timestamp to ISO-like string (matches _apple_ts_to_iso format)."""
+    if not ts_ms:
+        return ""
+    try:
+        return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, ValueError, OverflowError):
+        return ""
+
+
+def _find_chat_by_contact_api(chats: list, contact: str) -> dict | None:
+    """Find a chat in the API chat list by contact name, handle, or GUID."""
+    contact_lower = contact.lower().strip()
+    normalized = contact_lower.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+
+    for chat in chats:
+        # Match by GUID or chatIdentifier
+        guid = (chat.get("guid") or "").lower()
+        chat_id = (chat.get("chatIdentifier") or "").lower()
+        if normalized in guid or normalized in chat_id:
+            return chat
+
+        # Match by displayName
+        display = (chat.get("displayName") or "").lower()
+        if contact_lower in display:
+            return chat
+
+        # Match by participant handleId or displayName
+        for p in chat.get("participants", []):
+            h = (p.get("handleId") or "").lower()
+            d = (p.get("displayName") or "").lower()
+            if normalized in h or contact_lower in d:
+                return chat
+
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Helpers — osascript
@@ -140,11 +290,36 @@ def list_chats(limit: int = 50) -> str:
     List recent iMessage conversations (chats).
 
     Returns chat ID, display name, and participant names/handles.
-    Uses the Messages app via JXA. Shows up to `limit` chats.
+    Shows up to `limit` chats.
 
     Args:
         limit: Maximum number of chats to return (default 50).
     """
+    api = _get_api()
+    if api:
+        try:
+            chats = api.get_chats(limit)
+            if not chats:
+                return "No chats found."
+            lines = []
+            for chat in chats:
+                guid = chat.get("guid", "")
+                display = chat.get("displayName", "")
+                service = chat.get("serviceName") or _service_from_guid(guid)
+                parts = chat.get("participants", [])
+                if display:
+                    part_str = f" — {display}"
+                elif parts:
+                    part_str = " — " + ", ".join(
+                        p.get("displayName") or p.get("handleId", "?") for p in parts
+                    )
+                else:
+                    part_str = ""
+                lines.append(f"- `{guid}` [{service}]{part_str}")
+            return f"**{len(chats)} chats:**\n\n" + "\n".join(lines)
+        except Exception as e:
+            return f"API error: {e}"
+
     script = f"""
 const app = Application("Messages");
 const chats = app.chats();
@@ -181,6 +356,7 @@ JSON.stringify(result);
     lines = []
     for chat in data:
         chat_id = chat["id"]
+        service = _service_from_guid(chat_id)
         name = chat.get("name") or ""
         parts = chat.get("participants", [])
         if name:
@@ -191,7 +367,7 @@ JSON.stringify(result);
             )
         else:
             part_str = ""
-        lines.append(f"- `{chat_id}`{part_str}")
+        lines.append(f"- `{chat_id}` [{service}]{part_str}")
 
     return f"**{len(data)} chats:**\n\n" + "\n".join(lines)
 
@@ -204,6 +380,27 @@ def get_chat_participants(chat_id: str) -> str:
     Args:
         chat_id: The chat ID (e.g. 'iMessage;-;+15551234567' or 'iMessage;+;chat12345').
     """
+    api = _get_api()
+    if api:
+        try:
+            chats = api.get_chats(500)
+            chat = None
+            for c in chats:
+                if c.get("guid") == chat_id:
+                    chat = c
+                    break
+            if not chat:
+                return f"Chat not found: {chat_id}"
+            display = chat.get("displayName") or chat_id
+            lines = [f"**Chat:** {display}\n"]
+            for p in chat.get("participants", []):
+                name = p.get("displayName") or "Unknown"
+                handle = p.get("handleId") or ""
+                lines.append(f"- {name} ({handle})")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"API error: {e}"
+
     safe_id = chat_id.replace("\\", "\\\\").replace('"', '\\"')
     script = f"""
 const app = Application("Messages");
@@ -253,7 +450,7 @@ def get_messages(
     days_back: int = 0,
 ) -> str:
     """
-    Read messages from the Messages database (requires Full Disk Access).
+    Read messages from a chat.
 
     Provide either a chat_id OR a contact name/phone number to look up messages.
 
@@ -263,6 +460,15 @@ def get_messages(
         limit: Maximum number of messages to return (default 50, max 500).
         days_back: Only return messages from the last N days. 0 means no date filter.
     """
+    if not chat_id and not contact:
+        return "Please provide either a `chat_id` or `contact` to look up messages."
+
+    limit = min(max(1, limit), 500)
+
+    api = _get_api()
+    if api:
+        return _get_messages_api(api, chat_id, contact, limit, days_back)
+
     if not _db_available():
         return (
             "ERROR: Cannot access the Messages database.\n"
@@ -270,20 +476,14 @@ def get_messages(
             "Go to System Settings → Privacy & Security → Full Disk Access and add your terminal."
         )
 
-    if not chat_id and not contact:
-        return "Please provide either a `chat_id` or `contact` to look up messages."
-
-    limit = min(max(1, limit), 500)
     db = _get_db()
 
     try:
         if contact and not chat_id:
-            # Find chat by contact name or handle
             chat_id = _find_chat_by_contact(db, contact)
             if not chat_id:
                 return f'No chat found for contact "{contact}".'
 
-        # Query messages
         query = """
             SELECT
                 m.ROWID,
@@ -306,7 +506,6 @@ def get_messages(
 
         if days_back > 0:
             cutoff = datetime.now(timezone.utc).timestamp() - APPLE_EPOCH_OFFSET - (days_back * 86400)
-            # Convert to nanoseconds
             cutoff_ns = int(cutoff * 1_000_000_000)
             query += " AND m.date > ?"
             params.append(cutoff_ns)
@@ -319,22 +518,22 @@ def get_messages(
         if not rows:
             return f"No messages found in chat `{chat_id}`."
 
-        # Get chat name
         chat_name = _get_chat_display_name(db, chat_id)
+        service = _service_from_guid(chat_id)
 
-        lines = [f"**Chat:** {chat_name} (`{chat_id}`)\n**Messages** (newest first):\n"]
+        lines = [f"**Chat:** {chat_name} (`{chat_id}`) [{service}]"]
+        lines.append(f"**Reply with:** `send_message(to=\"{chat_id}\", ...)`\n")
+        lines.append("**Messages** (newest first):\n")
 
-        for row in reversed(rows):  # Show oldest first
+        for row in reversed(rows):
             text = row["text"] or ""
             is_from_me = row["is_from_me"]
             ts = _apple_ts_to_iso(row["date"])
             handle = row["handle_id"] or ""
             has_attachment = row["cache_has_attachments"]
 
-            # Skip reactions/tapbacks (associated_message_type != 0)
             assoc_type = row["associated_message_type"]
             if assoc_type and assoc_type != 0:
-                # Format tapback
                 tapback_map = {
                     2000: "❤️ Loved",
                     2001: "👍 Liked",
@@ -367,6 +566,84 @@ def get_messages(
         db.close()
 
 
+def _get_messages_api(api: ImessageApiClient, chat_id: str, contact: str, limit: int, days_back: int) -> str:
+    """Get messages via the REST API."""
+    try:
+        if contact and not chat_id:
+            chats = api.get_chats(500)
+            found = _find_chat_by_contact_api(chats, contact)
+            if not found:
+                return f'No chat found for contact "{contact}".'
+            chat_id = found["guid"]
+
+        encoded_id = urllib.parse.quote(chat_id, safe="")
+        messages = api._get(f"/chats/{encoded_id}/messages", {"limit": str(limit)})
+
+        if days_back > 0:
+            cutoff_ms = (datetime.now(timezone.utc).timestamp() - days_back * 86400) * 1000
+            messages = [m for m in messages if (m.get("date") or 0) > cutoff_ms]
+
+        if not messages:
+            return f"No messages found in chat `{chat_id}`."
+
+        # Get chat display name
+        chat_name = chat_id
+        try:
+            chats = api.get_chats(500)
+            for c in chats:
+                if c.get("guid") == chat_id:
+                    chat_name = c.get("displayName") or chat_id
+                    break
+        except Exception:
+            pass
+
+        service = _service_from_guid(chat_id)
+        lines = [f"**Chat:** {chat_name} (`{chat_id}`) [{service}]"]
+        lines.append(f"**Reply with:** `send_message(to=\"{chat_id}\", ...)`\n")
+        lines.append("**Messages** (newest first):\n")
+
+        tapback_map = {
+            2000: "❤️ Loved",
+            2001: "👍 Liked",
+            2002: "😂 Laughed at",
+            2003: "‼️ Emphasized",
+            2004: "❓ Questioned",
+            2005: "👎 Disliked",
+            3000: "Removed ❤️ from",
+            3001: "Removed 👍 from",
+            3002: "Removed 😂 from",
+            3003: "Removed ‼️ from",
+            3004: "Removed ❓ from",
+            3005: "Removed 👎 from",
+        }
+
+        for msg in messages:
+            text = msg.get("text") or ""
+            is_from_me = msg.get("isFromMe", False)
+            ts = _unix_ms_to_iso(msg.get("date"))
+            sender_name = msg.get("senderName") or ""
+            has_attachment = bool(msg.get("attachments"))
+
+            assoc_type = msg.get("associatedMessageType", 0)
+            if assoc_type and assoc_type != 0:
+                tapback = tapback_map.get(assoc_type, f"Reacted ({assoc_type}) to")
+                sender = "You" if is_from_me else sender_name
+                lines.append(f"  _[{ts}] {sender} {tapback} a message_")
+                continue
+
+            sender = "**You**" if is_from_me else f"**{sender_name}**"
+            attachment_note = " 📎" if has_attachment else ""
+            if text:
+                lines.append(f"[{ts}] {sender}: {text}{attachment_note}")
+            elif has_attachment:
+                lines.append(f"[{ts}] {sender}: _(attachment)_ 📎")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"API error: {e}"
+
+
 @mcp.tool()
 def search_messages(
     query: str,
@@ -375,7 +652,7 @@ def search_messages(
     days_back: int = 0,
 ) -> str:
     """
-    Search message text across all chats or a specific contact (requires Full Disk Access).
+    Search message text across all chats or a specific contact.
 
     Args:
         query: Text to search for (case-insensitive).
@@ -383,6 +660,15 @@ def search_messages(
         limit: Maximum results to return (default 30, max 200).
         days_back: Only search the last N days. 0 means search all.
     """
+    if not query.strip():
+        return "Please provide a non-empty search query."
+
+    limit = min(max(1, limit), 200)
+
+    api = _get_api()
+    if api:
+        return _search_messages_api(api, query, contact, limit, days_back)
+
     if not _db_available():
         return (
             "ERROR: Cannot access the Messages database.\n"
@@ -390,10 +676,6 @@ def search_messages(
             "Go to System Settings → Privacy & Security → Full Disk Access."
         )
 
-    if not query.strip():
-        return "Please provide a non-empty search query."
-
-    limit = min(max(1, limit), 200)
     db = _get_db()
 
     try:
@@ -444,7 +726,6 @@ def search_messages(
             chat_name = row["chat_name"] or row["chat_id"]
             sender = "You" if is_from_me else handle
 
-            # Truncate long messages
             if len(text) > 200:
                 text = text[:200] + "..."
             lines.append(f"- [{ts}] **{sender}** in _{chat_name}_: {text}")
@@ -455,6 +736,46 @@ def search_messages(
         db.close()
 
 
+def _search_messages_api(api: ImessageApiClient, query: str, contact: str, limit: int, days_back: int) -> str:
+    """Search messages via the REST API."""
+    try:
+        results = api._get("/search", {"q": query, "limit": str(limit)})
+
+        # Filter by contact if specified
+        if contact:
+            chats = api.get_chats(500)
+            found = _find_chat_by_contact_api(chats, contact)
+            if not found:
+                return f'No chat found for contact "{contact}".'
+            target_chat_id = found["id"]
+            results = [r for r in results if r.get("chatId") == target_chat_id]
+
+        # Filter by days_back
+        if days_back > 0:
+            cutoff_ms = (datetime.now(timezone.utc).timestamp() - days_back * 86400) * 1000
+            results = [r for r in results if (r.get("date") or 0) > cutoff_ms]
+
+        if not results:
+            return f'No messages found matching "{query}".'
+
+        lines = [f'**Found {len(results)} message(s) matching "{query}":**\n']
+        for r in results:
+            text = r.get("text") or ""
+            is_from_me = r.get("isFromMe", False)
+            ts = _unix_ms_to_iso(r.get("date"))
+            sender = "You" if is_from_me else (r.get("senderName") or "")
+            chat_name = r.get("chatDisplayName") or ""
+
+            if len(text) > 200:
+                text = text[:200] + "..."
+            lines.append(f"- [{ts}] **{sender}** in _{chat_name}_: {text}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"API error: {e}"
+
+
 @mcp.tool()
 def send_message(to: str, text: str) -> str:
     """
@@ -462,8 +783,14 @@ def send_message(to: str, text: str) -> str:
 
     IMPORTANT: This will actually send a message. Double-check the recipient and content.
 
+    IMPORTANT: When replying to an existing conversation, ALWAYS use the full chat ID
+    (e.g. 'iMessage;-;+15551234567' or 'SMS;-;+15551234567') to ensure the reply goes
+    through the same service (iMessage vs SMS) as the original thread. Using a bare phone
+    number defaults to iMessage and may create a separate conversation.
+
     Args:
-        to: Phone number (e.g. '+15551234567'), email, or chat ID.
+        to: Chat ID (e.g. 'SMS;-;+15551234567' or 'iMessage;-;+15551234567'), phone number, or email.
+             Prefer the full chat ID from list_chats/get_messages to preserve the correct service.
         text: The message text to send.
     """
     if not text.strip():
@@ -473,14 +800,26 @@ def send_message(to: str, text: str) -> str:
     safe_to = to.replace("\\", "\\\\").replace('"', '\\"')
 
     # Determine if sending to an existing chat or to a buddy
-    if safe_to.startswith("iMessage;") or safe_to.startswith("SMS;"):
+    # Chat IDs can start with "iMessage;", "SMS;", or "any;" (group chats)
+    if ";" in safe_to and (";" + "+" + ";" in safe_to or ";" + "-" + ";" in safe_to):
         # Sending to an existing chat by chat ID
-        script = f'''
-tell application "Messages"
-    set targetChat to a reference to chat id "{safe_to}"
-    send "{safe_text}" to targetChat
-end tell
+        # Use JXA instead of AppleScript for broader chat ID compatibility
+        jxa_text = text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        jxa_to = to.replace("\\", "\\\\").replace('"', '\\"')
+        jxa_script = f'''
+const app = Application("Messages");
+const chats = app.chats.whose({{id: "{jxa_to}"}})();
+if (chats.length === 0) {{
+    throw new Error("Chat not found: {jxa_to}");
+}}
+app.send("{jxa_text}", {{to: chats[0]}});
+"ok";
 '''
+        try:
+            _run_jxa(jxa_script, timeout=30)
+            return f"Message sent to `{to}`: {text}"
+        except RuntimeError as e:
+            return f"Failed to send message: {e}"
     else:
         # Sending to a phone/email — find the right service
         script = f'''
@@ -512,9 +851,82 @@ end tell
 
 
 @mcp.tool()
+def send_attachment(to: str, file_path: str, text: str = "") -> str:
+    """
+    Send a file attachment via iMessage/SMS.
+
+    IMPORTANT: This will actually send a message with an attachment. Double-check the recipient and file.
+
+    Args:
+        to: Chat ID (e.g. 'SMS;-;+15551234567' or 'iMessage;-;+15551234567'), phone number, or email.
+             Prefer the full chat ID from list_chats/get_messages to preserve the correct service.
+        file_path: Absolute path to the file to send (e.g. '/Users/ben/Desktop/photo.jpg').
+        text: Optional text message to send along with the attachment.
+    """
+    path = Path(file_path).expanduser().resolve()
+    if not path.exists():
+        return f"File not found: {path}"
+    if not path.is_file():
+        return f"Not a file: {path}"
+
+    posix_path = str(path)
+    safe_to = to.replace("\\", "\\\\").replace('"', '\\"')
+
+    if ";" in safe_to and (";" + "+" + ";" in safe_to or ";" + "-" + ";" in safe_to):
+        # Sending to an existing chat by chat ID — use JXA
+        jxa_to = to.replace("\\", "\\\\").replace('"', '\\"')
+        jxa_path = posix_path.replace("\\", "\\\\").replace('"', '\\"')
+        jxa_script = f'''
+const app = Application("Messages");
+const chats = app.chats.whose({{id: "{jxa_to}"}})();
+if (chats.length === 0) {{
+    throw new Error("Chat not found: {jxa_to}");
+}}
+app.send(Path("{jxa_path}"), {{to: chats[0]}});
+"ok";
+'''
+        try:
+            _run_jxa(jxa_script, timeout=30)
+        except RuntimeError as e:
+            return f"Failed to send attachment: {e}"
+    else:
+        # Sending to a phone/email
+        safe_path = posix_path.replace("\\", "\\\\").replace('"', '\\"')
+        script = f'''
+tell application "Messages"
+    set targetService to 1st account whose service type = iMessage
+    set targetBuddy to participant "{safe_to}" of targetService
+    send (POSIX file "{safe_path}") to targetBuddy
+end tell
+'''
+        try:
+            _run_applescript(script, timeout=30)
+        except RuntimeError as e:
+            error_str = str(e)
+            if "participant" in error_str.lower() or "buddy" in error_str.lower():
+                try:
+                    fallback_script = f'''
+tell application "Messages"
+    send (POSIX file "{safe_path}") to chat id "iMessage;-;{safe_to}"
+end tell
+'''
+                    _run_applescript(fallback_script, timeout=30)
+                except RuntimeError:
+                    return f"Failed to send attachment: {error_str}"
+            else:
+                return f"Failed to send attachment: {error_str}"
+
+    # Optionally send accompanying text
+    if text.strip():
+        send_message(to, text)
+
+    return f"Attachment sent to `{to}`: {path.name}" + (f" with message: {text}" if text.strip() else "")
+
+
+@mcp.tool()
 def get_recent_messages(limit: int = 30, days_back: int = 1) -> str:
     """
-    Get the most recent messages across ALL chats (requires Full Disk Access).
+    Get the most recent messages across ALL chats.
 
     Useful for catching up on recent conversations.
 
@@ -522,6 +934,12 @@ def get_recent_messages(limit: int = 30, days_back: int = 1) -> str:
         limit: Maximum number of messages (default 30, max 200).
         days_back: Only include messages from the last N days (default 1).
     """
+    limit = min(max(1, limit), 200)
+
+    api = _get_api()
+    if api:
+        return _get_recent_messages_api(api, limit, days_back)
+
     if not _db_available():
         return (
             "ERROR: Cannot access the Messages database.\n"
@@ -529,7 +947,6 @@ def get_recent_messages(limit: int = 30, days_back: int = 1) -> str:
             "Go to System Settings → Privacy & Security → Full Disk Access."
         )
 
-    limit = min(max(1, limit), 200)
     db = _get_db()
 
     try:
@@ -568,9 +985,11 @@ def get_recent_messages(limit: int = 30, days_back: int = 1) -> str:
         lines = [f"**{len(rows)} most recent messages:**\n"]
         current_chat = None
         for row in reversed(rows):
-            chat_name = row["chat_name"] or row["chat_id"]
+            chat_guid = row["chat_id"]
+            chat_name = row["chat_name"] or chat_guid
             if chat_name != current_chat:
-                lines.append(f"\n**--- {chat_name} ---**")
+                service = _service_from_guid(chat_guid)
+                lines.append(f"\n**--- {chat_name} [{service}] (`{chat_guid}`) ---**")
                 current_chat = chat_name
 
             text = row["text"] or ""
@@ -589,16 +1008,102 @@ def get_recent_messages(limit: int = 30, days_back: int = 1) -> str:
         db.close()
 
 
+def _get_recent_messages_api(api: ImessageApiClient, limit: int, days_back: int) -> str:
+    """Get recent messages across all chats via the REST API."""
+    try:
+        chats = api.get_chats(50)
+
+        if not chats:
+            return "No recent messages found."
+
+        cutoff_ms = (datetime.now(timezone.utc).timestamp() - days_back * 86400) * 1000 if days_back > 0 else 0
+
+        # Filter chats to those with recent activity
+        if cutoff_ms > 0:
+            chats = [c for c in chats if (c.get("lastMessageDate") or 0) > cutoff_ms]
+
+        if not chats:
+            return "No recent messages found."
+
+        # Fetch messages from each active chat
+        # Distribute limit across chats, minimum 5 per chat
+        per_chat = max(5, limit // len(chats)) if chats else limit
+        all_messages = []
+
+        for chat in chats:
+            guid = chat.get("guid", "")
+            service = chat.get("serviceName") or _service_from_guid(guid)
+            display = chat.get("displayName") or guid
+            encoded = urllib.parse.quote(guid, safe="")
+            try:
+                msgs = api._get(f"/chats/{encoded}/messages", {"limit": str(per_chat)})
+            except Exception:
+                continue
+            for msg in msgs:
+                msg["_chat_display"] = display
+                msg["_chat_service"] = service
+                msg["_chat_guid"] = guid
+            all_messages.extend(msgs)
+
+        # Filter by date and non-tapbacks
+        if cutoff_ms > 0:
+            all_messages = [m for m in all_messages if (m.get("date") or 0) > cutoff_ms]
+        all_messages = [
+            m for m in all_messages
+            if m.get("text") and (m.get("associatedMessageType", 0) or 0) == 0
+        ]
+
+        # Sort chronologically (newest first), then truncate
+        all_messages.sort(key=lambda m: m.get("date") or 0, reverse=True)
+        all_messages = all_messages[:limit]
+
+        if not all_messages:
+            return "No recent messages found."
+
+        lines = [f"**{len(all_messages)} most recent messages:**\n"]
+        current_chat = None
+        for msg in reversed(all_messages):
+            chat_name = msg.get("_chat_display", "")
+            if chat_name != current_chat:
+                chat_svc = msg.get("_chat_service", "")
+                chat_guid = msg.get("_chat_guid", "")
+                lines.append(f"\n**--- {chat_name} [{chat_svc}] (`{chat_guid}`) ---**")
+                current_chat = chat_name
+
+            text = msg.get("text") or ""
+            is_from_me = msg.get("isFromMe", False)
+            ts = _unix_ms_to_iso(msg.get("date"))
+            sender = "You" if is_from_me else (msg.get("senderName") or "")
+
+            if len(text) > 300:
+                text = text[:300] + "..."
+            lines.append(f"[{ts}] **{sender}**: {text}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"API error: {e}"
+
+
 @mcp.tool()
 def get_attachments(chat_id: str = "", contact: str = "", limit: int = 20) -> str:
     """
-    List attachments (images, files, etc.) from a specific chat (requires Full Disk Access).
+    List attachments (images, files, etc.) from a specific chat.
 
     Args:
         chat_id: The chat ID. Optional if contact is provided.
         contact: Contact name/phone to look up. Optional if chat_id is provided.
         limit: Maximum number of attachments (default 20, max 100).
     """
+    if not chat_id and not contact:
+        return "Please provide either a `chat_id` or `contact`."
+
+    limit = min(max(1, limit), 100)
+
+    api = _get_api()
+    if api:
+        return _get_attachments_api(api, chat_id, contact, limit)
+
     if not _db_available():
         return (
             "ERROR: Cannot access the Messages database.\n"
@@ -606,10 +1111,6 @@ def get_attachments(chat_id: str = "", contact: str = "", limit: int = 20) -> st
             "Go to System Settings → Privacy & Security → Full Disk Access."
         )
 
-    if not chat_id and not contact:
-        return "Please provide either a `chat_id` or `contact`."
-
-    limit = min(max(1, limit), 100)
     db = _get_db()
 
     try:
@@ -657,7 +1158,6 @@ def get_attachments(chat_id: str = "", contact: str = "", limit: int = 20) -> st
             size_str = _format_bytes(size) if size else "?"
             lines.append(f"- [{ts}] **{sender}**: {filename} ({mime}, {size_str})")
             if path:
-                # Expand ~ in path
                 expanded = path.replace("~", str(Path.home()))
                 lines.append(f"  Path: `{expanded}`")
 
@@ -667,14 +1167,98 @@ def get_attachments(chat_id: str = "", contact: str = "", limit: int = 20) -> st
         db.close()
 
 
+def _get_attachments_api(api: ImessageApiClient, chat_id: str, contact: str, limit: int) -> str:
+    """Get attachments via the REST API."""
+    try:
+        if contact and not chat_id:
+            chats = api.get_chats(500)
+            found = _find_chat_by_contact_api(chats, contact)
+            if not found:
+                return f'No chat found for contact "{contact}".'
+            chat_id = found["guid"]
+
+        # Fetch enough messages to find attachments
+        encoded_id = urllib.parse.quote(chat_id, safe="")
+        messages = api._get(f"/chats/{encoded_id}/messages", {"limit": "200"})
+
+        # Get chat display name
+        chat_name = chat_id
+        try:
+            chats = api.get_chats(500)
+            for c in chats:
+                if c.get("guid") == chat_id:
+                    chat_name = c.get("displayName") or chat_id
+                    break
+        except Exception:
+            pass
+
+        # Collect attachments
+        attachment_entries = []
+        api_base = api.base_url
+        for msg in messages:
+            attachments = msg.get("attachments", [])
+            if not attachments:
+                continue
+            for att in attachments:
+                attachment_entries.append({
+                    "id": att.get("id"),
+                    "filename": att.get("transferName") or att.get("filename") or "unknown",
+                    "mime": att.get("mimeType") or "unknown",
+                    "size": att.get("totalBytes") or 0,
+                    "ts": _unix_ms_to_iso(msg.get("date")),
+                    "sender": "You" if msg.get("isFromMe") else (msg.get("senderName") or "?"),
+                    "api_url": f"{api_base}/attachments/{att.get('id')}",
+                })
+                if len(attachment_entries) >= limit:
+                    break
+            if len(attachment_entries) >= limit:
+                break
+
+        if not attachment_entries:
+            return f"No attachments found in chat `{chat_id}`."
+
+        lines = [f"**Attachments in {chat_name}:**\n"]
+        for att in attachment_entries:
+            size_str = _format_bytes(att["size"]) if att["size"] else "?"
+            lines.append(f"- [{att['ts']}] **{att['sender']}**: {att['filename']} ({att['mime']}, {size_str})")
+            lines.append(f"  API: `{att['api_url']}`")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"API error: {e}"
+
+
 @mcp.tool()
 def check_db_access() -> str:
     """
-    Check whether the Messages database is accessible.
+    Check whether message data is accessible (via API or direct database).
 
-    If not, provides instructions for enabling Full Disk Access.
-    Tools that read message history require database access.
+    If not, provides instructions for enabling access.
+    Tools that read message history require either API or database access.
     """
+    api = _get_api()
+    if api:
+        try:
+            health = api.health()
+            status = health.get("status", "unknown")
+            # Also try an authenticated request to verify credentials
+            chats = api.get_chats(1)
+            return (
+                f"imessage-api is connected.\n"
+                f"- API status: {status}\n"
+                f"- API URL: {api.base_url}\n"
+                f"- Authentication: OK\n"
+                f"- Backend: REST API (no local FDA required)"
+            )
+        except Exception as e:
+            return (
+                f"imessage-api is configured but not reachable.\n"
+                f"- API URL: {api.base_url}\n"
+                f"- Error: {e}\n\n"
+                f"Make sure the API is running: cd /path/to/imessage-api && npm start"
+            )
+
     if _db_available():
         db = _get_db()
         try:
@@ -696,6 +1280,8 @@ def check_db_access() -> str:
             "2. Click the '+' button\n"
             "3. Add your terminal app (Terminal.app, iTerm2, VS Code, etc.)\n"
             "4. Restart the terminal and re-run the server\n\n"
+            "Alternatively, set IMESSAGE_API_URL and IMESSAGE_API_PASSWORD env vars\n"
+            "to use the imessage-api REST backend (no FDA required for this process).\n\n"
             "Note: `list_chats`, `get_chat_participants`, and `send_message` work "
             "without database access (they use AppleScript)."
         )
