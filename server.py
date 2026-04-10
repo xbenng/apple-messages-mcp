@@ -112,6 +112,62 @@ class ImessageApiClient:
     def _post(self, path: str, body: dict | None = None) -> any:
         return self._request("POST", path, body=body)
 
+    def send_attachment(self, to: str, file_path: str, text: str = "", service: str = "iMessage") -> dict:
+        """Send an attachment via multipart/form-data POST /send."""
+        import mimetypes
+
+        if self._token is None:
+            self._authenticate()
+
+        boundary = f"----MCP{int(time.time() * 1000)}"
+        body_parts = []
+
+        # "to" field
+        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"to\"\r\n\r\n{to}")
+        # "service" field
+        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"service\"\r\n\r\n{service}")
+        # optional "text" field
+        if text:
+            body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\n{text}")
+
+        # file field
+        filename = Path(file_path).name
+        mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+
+        file_header = (
+            f"--{boundary}\r\n"
+            f"Content-Disposition: form-data; name=\"attachment\"; filename=\"{filename}\"\r\n"
+            f"Content-Type: {mime}\r\n\r\n"
+        )
+
+        # Build the full multipart body as bytes
+        payload = b""
+        for part in body_parts:
+            payload += part.encode() + b"\r\n"
+        payload += file_header.encode() + file_data + b"\r\n"
+        payload += f"--{boundary}--\r\n".encode()
+
+        url = f"{self.base_url}/send"
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        }
+
+        for attempt in range(2):
+            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    return json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 0:
+                    self._authenticate()
+                    headers["Authorization"] = f"Bearer {self._token}"
+                    continue
+                error_body = e.read().decode() if e.fp else ""
+                raise RuntimeError(f"HTTP {e.code}: {error_body}") from e
+
     def get_chats(self, limit: int = 100) -> list:
         """Get chats, cached for 30 seconds."""
         now = time.time()
@@ -166,30 +222,50 @@ def _unix_ms_to_iso(ts_ms: int | None) -> str:
 
 
 def _find_chat_by_contact_api(chats: list, contact: str) -> dict | None:
-    """Find a chat in the API chat list by contact name, handle, or GUID."""
+    """Find a chat in the API chat list by contact name, handle, or GUID.
+
+    Prefers 1:1 chats over group chats so that looking up a person returns
+    the direct conversation rather than a group they happen to be in.
+    """
     contact_lower = contact.lower().strip()
     normalized = contact_lower.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
 
+    best: dict | None = None
+    best_is_direct = False
+
     for chat in chats:
+        is_direct = len(chat.get("participants", [])) <= 1
+
         # Match by GUID or chatIdentifier
         guid = (chat.get("guid") or "").lower()
         chat_id = (chat.get("chatIdentifier") or "").lower()
-        if normalized in guid or normalized in chat_id:
-            return chat
+        matched = normalized in guid or normalized in chat_id
 
         # Match by displayName
-        display = (chat.get("displayName") or "").lower()
-        if contact_lower in display:
-            return chat
+        if not matched:
+            display = (chat.get("displayName") or "").lower()
+            matched = contact_lower in display
 
         # Match by participant handleId or displayName
-        for p in chat.get("participants", []):
-            h = (p.get("handleId") or "").lower()
-            d = (p.get("displayName") or "").lower()
-            if normalized in h or contact_lower in d:
-                return chat
+        if not matched:
+            for p in chat.get("participants", []):
+                h = (p.get("handleId") or "").lower()
+                d = (p.get("displayName") or "").lower()
+                if normalized in h or contact_lower in d:
+                    matched = True
+                    break
 
-    return None
+        if not matched:
+            continue
+
+        # Prefer direct (1:1) chats over group chats
+        if best is None or (is_direct and not best_is_direct):
+            best = chat
+            best_is_direct = is_direct
+            if best_is_direct:
+                break  # Can't do better than a direct match
+
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -747,8 +823,9 @@ def _search_messages_api(api: ImessageApiClient, query: str, contact: str, limit
             found = _find_chat_by_contact_api(chats, contact)
             if not found:
                 return f'No chat found for contact "{contact}".'
-            target_chat_id = found["id"]
-            results = [r for r in results if r.get("chatId") == target_chat_id]
+            target_chat_id = found["id"]  # numeric id, matches searchResult.chatId
+            target_guid = found["guid"]
+            results = [r for r in results if r.get("chatId") == target_chat_id or r.get("chatGuid") == target_guid]
 
         # Filter by days_back
         if days_back > 0:
@@ -802,21 +879,14 @@ def send_message(to: str, text: str) -> str:
     # Determine if sending to an existing chat or to a buddy
     # Chat IDs can start with "iMessage;", "SMS;", or "any;" (group chats)
     if ";" in safe_to and (";" + "+" + ";" in safe_to or ";" + "-" + ";" in safe_to):
-        # Sending to an existing chat by chat ID
-        # Use JXA instead of AppleScript for broader chat ID compatibility
-        jxa_text = text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-        jxa_to = to.replace("\\", "\\\\").replace('"', '\\"')
-        jxa_script = f'''
-const app = Application("Messages");
-const chats = app.chats.whose({{id: "{jxa_to}"}})();
-if (chats.length === 0) {{
-    throw new Error("Chat not found: {jxa_to}");
-}}
-app.send("{jxa_text}", {{to: chats[0]}});
-"ok";
+        # Sending to an existing chat by chat ID — use AppleScript chat id
+        script = f'''
+tell application "Messages"
+    send "{safe_text}" to chat id "{safe_to}"
+end tell
 '''
         try:
-            _run_jxa(jxa_script, timeout=30)
+            _run_applescript(script, timeout=30)
             return f"Message sent to `{to}`: {text}"
         except RuntimeError as e:
             return f"Failed to send message: {e}"
@@ -870,57 +940,92 @@ def send_attachment(to: str, file_path: str, text: str = "") -> str:
         return f"Not a file: {path}"
 
     posix_path = str(path)
-    safe_to = to.replace("\\", "\\\\").replace('"', '\\"')
 
-    if ";" in safe_to and (";" + "+" + ";" in safe_to or ";" + "-" + ";" in safe_to):
-        # Sending to an existing chat by chat ID — use JXA
-        jxa_to = to.replace("\\", "\\\\").replace('"', '\\"')
-        jxa_path = posix_path.replace("\\", "\\\\").replace('"', '\\"')
-        jxa_script = f'''
-const app = Application("Messages");
-const chats = app.chats.whose({{id: "{jxa_to}"}})();
-if (chats.length === 0) {{
-    throw new Error("Chat not found: {jxa_to}");
-}}
-app.send(Path("{jxa_path}"), {{to: chats[0]}});
-"ok";
-'''
+    # Determine service from chat ID for API backend
+    service = "iMessage"
+    if to.startswith("SMS;"):
+        service = "SMS"
+
+    # Extract the recipient handle for the API (e.g. "+15551234567" from "iMessage;-;+15551234567")
+    api_to = to
+    if ";" in to:
+        parts = to.split(";")
+        if len(parts) >= 3:
+            api_to = parts[-1]  # the handle portion
+
+    # Try API backend first, fall through to AppleScript on failure
+    api = _get_api()
+    if api:
         try:
-            _run_jxa(jxa_script, timeout=30)
-        except RuntimeError as e:
-            return f"Failed to send attachment: {e}"
-    else:
-        # Sending to a phone/email
-        safe_path = posix_path.replace("\\", "\\\\").replace('"', '\\"')
+            api.send_attachment(to=api_to, file_path=posix_path, text=text, service=service)
+            result = f"Attachment sent to `{to}`: {path.name}"
+            if text.strip():
+                result += f" with message: {text}"
+            return result
+        except Exception:
+            pass  # fall through to AppleScript
+
+    # AppleScript: copy file to Messages Attachments dir first (Messages
+    # cannot transfer files from arbitrary paths — transfer_state stays 6).
+    attach_dir = Path.home() / "Library" / "Messages" / "Attachments" / "outgoing"
+    attach_dir.mkdir(parents=True, exist_ok=True)
+    staged = attach_dir / path.name
+    if staged.resolve() != path.resolve():
+        import shutil
+        shutil.copy2(path, staged)
+    staged_posix = str(staged)
+
+    safe_to = to.replace("\\", "\\\\").replace('"', '\\"')
+    safe_path = staged_posix.replace("\\", "\\\\").replace('"', '\\"')
+
+    is_chat_id = ";" in to and (";+;" in to or ";-;" in to)
+
+    if is_chat_id:
+        # Send to existing chat by ID — use alias for reliable transfer
         script = f'''
+set theFile to POSIX file "{safe_path}" as alias
+tell application "Messages"
+    send theFile to chat id "{safe_to}"
+end tell
+'''
+    else:
+        # Send to phone/email
+        script = f'''
+set theFile to POSIX file "{safe_path}" as alias
 tell application "Messages"
     set targetService to 1st account whose service type = iMessage
     set targetBuddy to participant "{safe_to}" of targetService
-    send (POSIX file "{safe_path}") to targetBuddy
+    send theFile to targetBuddy
 end tell
 '''
-        try:
-            _run_applescript(script, timeout=30)
-        except RuntimeError as e:
-            error_str = str(e)
-            if "participant" in error_str.lower() or "buddy" in error_str.lower():
-                try:
-                    fallback_script = f'''
-tell application "Messages"
-    send (POSIX file "{safe_path}") to chat id "iMessage;-;{safe_to}"
-end tell
-'''
-                    _run_applescript(fallback_script, timeout=30)
-                except RuntimeError:
-                    return f"Failed to send attachment: {error_str}"
-            else:
-                return f"Failed to send attachment: {error_str}"
 
-    # Optionally send accompanying text
+    try:
+        _run_applescript(script, timeout=30)
+    except RuntimeError as e:
+        error_str = str(e)
+        # Fallback: try the other approach
+        if not is_chat_id:
+            try:
+                fallback = f'''
+set theFile to POSIX file "{safe_path}" as alias
+tell application "Messages"
+    send theFile to chat id "iMessage;-;{safe_to}"
+end tell
+'''
+                _run_applescript(fallback, timeout=30)
+            except RuntimeError:
+                return f"Failed to send attachment: {error_str}"
+        else:
+            return f"Failed to send attachment: {error_str}"
+
+    # Optionally send accompanying text (AppleScript can't send file+text in one go)
     if text.strip():
         send_message(to, text)
 
-    return f"Attachment sent to `{to}`: {path.name}" + (f" with message: {text}" if text.strip() else "")
+    result = f"Attachment sent to `{to}`: {path.name}"
+    if text.strip():
+        result += f" with message: {text}"
+    return result
 
 
 @mcp.tool()
@@ -1136,6 +1241,7 @@ def get_attachments(chat_id: str = "", contact: str = "", limit: int = 20) -> st
             JOIN chat c ON c.ROWID = cmj.chat_id
             LEFT JOIN handle h ON m.handle_id = h.ROWID
             WHERE c.guid = ?
+              AND (a.transfer_state = 0 OR a.transfer_state = 5)
             ORDER BY m.date DESC
             LIMIT ?
         """
@@ -1192,22 +1298,24 @@ def _get_attachments_api(api: ImessageApiClient, chat_id: str, contact: str, lim
         except Exception:
             pass
 
-        # Collect attachments
+        # Collect attachments (iterate newest-first so we get the most recent)
         attachment_entries = []
-        api_base = api.base_url
-        for msg in messages:
+        for msg in reversed(messages):
             attachments = msg.get("attachments", [])
             if not attachments:
                 continue
             for att in attachments:
+                att_id = att.get("id")
+                if att_id is None:
+                    continue
                 attachment_entries.append({
-                    "id": att.get("id"),
+                    "id": att_id,
                     "filename": att.get("transferName") or att.get("filename") or "unknown",
                     "mime": att.get("mimeType") or "unknown",
                     "size": att.get("totalBytes") or 0,
+                    "is_sticker": att.get("isSticker", False),
                     "ts": _unix_ms_to_iso(msg.get("date")),
                     "sender": "You" if msg.get("isFromMe") else (msg.get("senderName") or "?"),
-                    "api_url": f"{api_base}/attachments/{att.get('id')}",
                 })
                 if len(attachment_entries) >= limit:
                     break
@@ -1220,8 +1328,9 @@ def _get_attachments_api(api: ImessageApiClient, chat_id: str, contact: str, lim
         lines = [f"**Attachments in {chat_name}:**\n"]
         for att in attachment_entries:
             size_str = _format_bytes(att["size"]) if att["size"] else "?"
-            lines.append(f"- [{att['ts']}] **{att['sender']}**: {att['filename']} ({att['mime']}, {size_str})")
-            lines.append(f"  API: `{att['api_url']}`")
+            sticker = " (sticker)" if att["is_sticker"] else ""
+            lines.append(f"- [{att['ts']}] **{att['sender']}**: {att['filename']} ({att['mime']}, {size_str}){sticker}")
+            lines.append(f"  Download: `GET /attachments/{att['id']}`")
 
         return "\n".join(lines)
 
