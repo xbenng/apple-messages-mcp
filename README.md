@@ -4,6 +4,8 @@ An [MCP](https://modelcontextprotocol.io/) server that exposes Apple Messages (i
 
 **macOS only** — uses AppleScript/JXA and the Messages SQLite database.
 
+> This is the **`api-backend`** branch. It can optionally delegate database reads and message sending to a running [`imessage-api`](https://github.com/xbenng/imessage-api) REST server (see [Optional: REST backend](#optional-rest-backend)). If `IMESSAGE_API_URL` / `IMESSAGE_API_PASSWORD` are not set, it behaves identically to `main` — direct SQLite + JXA.
+
 ## Features
 
 | Tool | Description | Requires DB? |
@@ -105,6 +107,24 @@ Add to `.vscode/mcp.json` or user settings:
 
 **Send a message:**
 > "Send 'On my way!' to +15551234567"
+
+## Optional: REST backend
+
+Instead of reading `chat.db` and invoking JXA locally, the server can delegate to [`imessage-api`](https://github.com/xbenng/imessage-api) — a Hono-based REST server that owns the database and send pipeline. This is useful when the MCP host (e.g. a remote Claude Code session, a container, a different user account) doesn't itself have Full Disk Access or can't reach the Messages app, but a separate macOS process does.
+
+Set these environment variables before launching the server:
+
+```bash
+export IMESSAGE_API_URL="http://<host>:3001"
+export IMESSAGE_API_PASSWORD="<the password that matches AUTH_PASSWORD_HASH>"
+```
+
+When both are set, the MCP server:
+- Authenticates against `POST /auth/login` and caches the JWT
+- Routes `list_chats`, `get_messages`, `search_messages`, `get_recent_messages`, `get_attachments`, and `send_message` through the API
+- Still falls back to local JXA/SQLite for tools the API doesn't cover
+
+If either var is unset, the REST client is not initialized and everything runs locally.
 
 ## Notes
 
