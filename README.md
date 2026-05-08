@@ -2,40 +2,28 @@
 
 An [MCP](https://modelcontextprotocol.io/) server that exposes Apple Messages (iMessage/SMS) to Claude or any MCP-compatible client.
 
-**macOS only** — uses AppleScript/JXA and the Messages SQLite database.
-
-> This is the **`api-backend`** branch. It can optionally delegate database reads and message sending to a running [`imessage-api`](https://github.com/xbenng/imessage-api) REST server (see [Optional: REST backend](#optional-rest-backend)). If `IMESSAGE_API_URL` / `IMESSAGE_API_PASSWORD` are not set, it behaves identically to `main` — direct SQLite + JXA.
+The MCP itself has **no macOS dependency** — it's a thin Python client that talks to a separate [`imessage-api`](https://github.com/xbenng/imessage-api) REST server running on a Mac. So this MCP can run on Linux, in a container, or anywhere Python runs, as long as it can reach the API host.
 
 ## Features
 
-| Tool | Description | Requires DB? |
-|------|-------------|:---:|
-| `list_chats` | List recent conversations with participant names | No |
-| `get_chat_participants` | Get participants of a specific chat | No |
-| `send_message` | Send an iMessage/SMS to a phone, email, or chat | No |
-| `get_messages` | Read message history from a chat (by ID or contact) | **Yes** |
-| `search_messages` | Full-text search across all messages | **Yes** |
-| `get_recent_messages` | Get the N most recent messages across all chats | **Yes** |
-| `get_attachments` | List attachments from a chat | **Yes** |
-| `check_db_access` | Check whether the Messages DB is accessible | No |
+| Tool | Description |
+|------|-------------|
+| `list_chats` | List recent conversations with participant names |
+| `get_chat_participants` | Get participants of a specific chat |
+| `send_message` | Send an iMessage/SMS to a phone, email, or chat |
+| `send_attachment` | Send a file attachment |
+| `get_messages` | Read message history from a chat (by ID or contact) |
+| `search_messages` | Full-text search across all messages |
+| `get_recent_messages` | Get the N most recent messages across all chats |
+| `get_attachments` | List attachments from a chat |
+| `fetch_attachment` | Download an attachment by id and save it locally |
+| `check_db_access` | Check whether the API backend is reachable and authenticated |
 
 ## Requirements
 
-- macOS
 - Python 3.10+
 - [mcp](https://pypi.org/project/mcp/) (`pip install mcp`)
-- Apple Messages app configured with an iMessage account
-
-### Full Disk Access (for message reading)
-
-Tools that read message history query `~/Library/Messages/chat.db` directly, which requires **Full Disk Access** for the host process.
-
-To enable:
-1. Open **System Settings → Privacy & Security → Full Disk Access**
-2. Click '+' and add your terminal (Terminal.app, iTerm2, VS Code, etc.)
-3. Restart the terminal
-
-Without Full Disk Access, `list_chats`, `get_chat_participants`, and `send_message` still work — they use AppleScript which only requires Automation access.
+- A running [`imessage-api`](https://github.com/xbenng/imessage-api) on a Mac, reachable from this host
 
 ## Installation
 
@@ -47,18 +35,32 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Usage
+## Configuration
+
+Set these env vars when launching the server:
+
+```bash
+IMESSAGE_API_URL="http://<mac-host>:3001"
+IMESSAGE_API_PASSWORD="<the password that matches the API's AUTH_PASSWORD_HASH>"
+```
+
+If either is missing, every tool returns a clear error.
 
 ### Claude Code (CLI)
 
-Add to `~/.claude/settings.json`:
+Add to `~/.claude.json` (or `~/.claude/settings.json`):
 
 ```json
 {
   "mcpServers": {
     "apple-messages": {
+      "type": "stdio",
       "command": "/path/to/apple-messages-mcp/.venv/bin/python",
-      "args": ["/path/to/apple-messages-mcp/server.py"]
+      "args": ["/path/to/apple-messages-mcp/server.py"],
+      "env": {
+        "IMESSAGE_API_URL": "http://ng-macbook-pro.lan:3001",
+        "IMESSAGE_API_PASSWORD": "your-password"
+      }
     }
   }
 }
@@ -66,33 +68,11 @@ Add to `~/.claude/settings.json`:
 
 ### Claude Desktop
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "apple-messages": {
-      "command": "/path/to/apple-messages-mcp/.venv/bin/python",
-      "args": ["/path/to/apple-messages-mcp/server.py"]
-    }
-  }
-}
-```
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` with the same shape.
 
 ### VS Code (Copilot)
 
-Add to `.vscode/mcp.json` or user settings:
-
-```json
-{
-  "servers": {
-    "apple-messages": {
-      "command": "/path/to/apple-messages-mcp/.venv/bin/python",
-      "args": ["/path/to/apple-messages-mcp/server.py"]
-    }
-  }
-}
-```
+Add to `.vscode/mcp.json` or user settings with the same shape under `"servers"`.
 
 ## Examples
 
@@ -108,28 +88,9 @@ Add to `.vscode/mcp.json` or user settings:
 **Send a message:**
 > "Send 'On my way!' to +15551234567"
 
-## Optional: REST backend
-
-Instead of reading `chat.db` and invoking JXA locally, the server can delegate to [`imessage-api`](https://github.com/xbenng/imessage-api) — a Hono-based REST server that owns the database and send pipeline. This is useful when the MCP host (e.g. a remote Claude Code session, a container, a different user account) doesn't itself have Full Disk Access or can't reach the Messages app, but a separate macOS process does.
-
-Set these environment variables before launching the server:
-
-```bash
-export IMESSAGE_API_URL="http://<host>:3001"
-export IMESSAGE_API_PASSWORD="<the password that matches AUTH_PASSWORD_HASH>"
-```
-
-When both are set, the MCP server:
-- Authenticates against `POST /auth/login` and caches the JWT
-- Routes `list_chats`, `get_messages`, `search_messages`, `get_recent_messages`, `get_attachments`, and `send_message` through the API
-- Still falls back to local JXA/SQLite for tools the API doesn't cover
-
-If either var is unset, the REST client is not initialized and everything runs locally.
-
 ## Notes
 
-- The `send_message` tool **actually sends messages** — the AI will confirm before sending.
+- `send_message` and `send_attachment` **actually send** — the AI will confirm first.
 - Message timestamps are in UTC.
-- Group chats are identified by their chat ID (e.g. `iMessage;+;chat12345`). Individual chats use the format `iMessage;-;+15551234567`.
-- The server opens the Messages database in **read-only** mode. It never modifies your message history.
-- Apple Messages must be authorized for automation in **System Settings → Privacy & Security → Automation**.
+- Group chats use IDs like `any;+;<guid>`; 1:1 chats use `iMessage;-;+15551234567` or `SMS;-;+15551234567`. When sending into an existing thread, prefer the full chat ID so the message lands in the right conversation (and on the right service).
+- The MCP only reads — all writes (`/send`) go through the API server, which is the only process touching `Messages.app` or `chat.db`.
